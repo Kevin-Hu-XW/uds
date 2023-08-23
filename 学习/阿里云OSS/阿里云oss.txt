@@ -1,0 +1,770 @@
+OSS 阿里云账号：uds-aliyun-oss@1649627126846932.onaliyun.com ,密码：root1234!
+# 阿里云OSS
+
+## 服务端签名后直传
+### 普通上传
+
+![](C:\Users\Admin\Desktop\工作\uds\学习\普通直传.png)
+
+普通上传方式通过InputStream作为OSS文件的数据源。用户(浏览器)把文件交给我们自已的服务器，再由服务器携带相关验证信息上传文件至阿里云，这种方式每上传一次，文件就会经过一次我们自已的服务器(占用大量带宽)，我们的服务器也会在大量的用户下带来瓶颈。影响服务器处理别的请求，大大降低了效率。
+
+
+### 服务端签名后直传
+
+![](C:\Users\Admin\Desktop\工作\uds\学习\服务端签名后直传.png)
+
+流程介绍
+
+1. Web前端请求应用服务器，获取上传所需参数（如OSS的accessKeyId、policy、callback等参数）
+2. 应用服务器返回相关参数
+3. Web前端直接向OSS服务发起上传文件请求
+4. 等上传完成后OSS服务会回调应用服务器的回调接口
+5. 应用服务器返回响应给OSS服务
+6. OSS服务将应用服务器回调接口的内容返回给Web前端
+
+**为什么要在服务端进行签名？**
+
+如果直接在浏览器通过js代码直接生成授权签名并拿着签名传递给OSS，这样是比较方便但是不安全，别人可以很随便的就拿到你的账号密钥
+
+
+
+
+
+## OSS分片上传
+
+### 使用场景
+- 大文件加速上传
+
+  当文件大小超过5 GB时，使用分片上传可实现并行上传多个Part以加快上传速度。
+
+- 网络环境较差
+
+  网络环境较差时，建议使用分片上传。当出现上传失败的时候，您仅需重传失败的Part。
+
+- 文件大小不确定
+
+  可以在需要上传的文件大小还不确定的情况下开始上传，这种场景在视频监控等行业应用中比较常见。
+
+### 分片上传流程
+
+![](C:\Users\Admin\Desktop\工作\uds\学习\大文件分片上传.PNG)
+
+1. 前端获取到文件流，将待上传文件按照一定大小进行分片，计算出文件的唯一标识identifier（md5摘要）。
+
+2. 将获取到的identifier传递给后端，查询该文件的上传任务记录。如果没有则初始化一个上传任务；
+
+   使用[InitiateMultipartUpload](https://help.aliyun.com/document_detail/31992.htm#reference-zgh-cnx-wdb)接口初始化一个分片上传任务，方法返回OSS创建的全局唯一的uploadId。
+
+   如果有上传记录，则通过ossClient.listParts(listPartsRequest)返回已上传的分片
+
+3. 校验分片上传是否完成（成功执行合并操作则表示上传分片完成）
+
+   3.1 上传分片完成，则返回文件地址
+
+   3.2 任务未完成，前端根据分片大小将文件分片与后端返回已上传的分片列表进行比较，遍历所有的分片，如果分片已存在于后端返回的分片列表中，则跳过该分片，否则通过向后端获取分片的预签名上传地址进行上传该分片ossClient.generatePresignedUrl(request),所有分片上传完成后，请求后端合并接口就行合并，后端通过使用[CompleteMultipartUpload](https://help.aliyun.com/document_detail/31995.htm#reference-lq1-dtx-wdb)接口将Part组合成一个Objec
+
+**注意**
+
+```
+说明
+对于同一个uploadId，分片号（PartNumber）标识了该分片在整个文件内的相对位置。如果使用同一个分片号上传了新的数据，则OSS上该分片已有的数据将会被覆盖。
+OSS将收到的分片数据的MD5值放在ETag头内返回给用户。
+OSS计算上传数据的MD5值，并与SDK计算的MD5值比较，如果不一致则返回InvalidDigest错误码
+```
+
+### 使用限制
+
+| 限制项                                                       | 规格                                                         |
+| :----------------------------------------------------------- | :----------------------------------------------------------- |
+| 文件大小                                                     | 不超过48.8 TB                                                |
+| Part数量                                                     | 1~10, 000个                                                  |
+| 单个Part大小                                                 | 最小值为100 KB，最大值为5 GB。最后一个Part的大小不要求大于100 KB。 |
+| 单次ListParts请求返回的Part最大数量                          | 1, 000个                                                     |
+| 单次ListMultipartUploads请求返回的Multipart Upload事件最大数量 | 1, 000个                                                     |
+
+**关键代码**
+
+```java 
+// 初始化分片。
+InitiateMultipartUploadResult upresult = ossClient.initiateMultipartUpload(request);
+// 返回uploadId，它是分片上传事件的唯一标识。您可以根据该uploadId发起相关的操作，例如取消分片上传、查询分片上传等。
+String uploadId = upresult.getUploadId();
+// partETags是PartETag的集合。PartETag由分片的ETag和分片号组成。
+List<PartETag> partETags =  new ArrayList<PartETag>();
+// 每个分片的大小，用于计算文件有多少个分片。单位为字节。
+final long partSize = 1 * 1024 * 1024L;   //1 MB。
+// 填写本地文件的完整路径 
+.....
+// 遍历分片上传。
+    for (int i = 0; i < partCount; i++) {
+        long startPos = i * partSize;
+        long curPartSize = (i + 1 == partCount) ? (fileLength - startPos) : partSize;
+        InputStream instream = new FileInputStream(sampleFile);
+        // 跳过已经上传的分片。
+        instream.skip(startPos);
+        UploadPartRequest uploadPartRequest = new UploadPartRequest();
+        uploadPartRequest.setBucketName(bucketName);
+        uploadPartRequest.setKey(objectName);
+        uploadPartRequest.setUploadId(uploadId);
+        uploadPartRequest.setInputStream(instream);
+        // 设置分片大小。除了最后一个分片没有大小限制，其他的分片最小为100 KB。
+        uploadPartRequest.setPartSize(curPartSize);
+        // 设置分片号。每一个上传的分片都有一个分片号，取值范围是1~10000，如果超出此范围，OSS将返回InvalidArgument错误码。
+        uploadPartRequest.setPartNumber( i + 1);
+        // 每个分片不需要按顺序上传，甚至可以在不同客户端上传，OSS会按照分片号排序组成完整的文件。
+        UploadPartResult uploadPartResult = ossClient.uploadPart(uploadPartRequest);
+        // 每次上传分片之后，OSS的返回结果包含PartETag。PartETag将被保存在partETags中。
+        partETags.add(uploadPartResult.getPartETag());
+    }
+
+// 创建CompleteMultipartUploadRequest对象。分片合并对象
+// 在执行完成分片上传操作时，需要提供所有有效的partETags。OSS收到提交的partETags后，会逐一验证每个分片的有效性。当所有的数据分片验证通过后，OSS将把这些分片组合成一个完整的文件。
+CompleteMultipartUploadRequest completeMultipartUploadRequest =
+                    new CompleteMultipartUploadRequest(bucketName, objectName, uploadId,partETags);
+// 完成分片上传。
+            CompleteMultipartUploadResult completeMultipartUploadResult = ossClient.completeMultipartUpload(completeMultipartUploadRequest);
+```
+
+### 代码实现
+
+**根据文件唯一标识获取上传任务**
+
+```java
+public Res<TaskInfoDTO> queryTaskInfo(ReqFile reqFile) throws Exception{
+        Res<TaskInfoDTO> res = new Res<>();
+        try{
+            Map<String,Object> map  = new HashMap<>();
+            map.put("userId",reqFile.getUserId());
+            map.put("fileIdentifier",reqFile.getIdentifier());
+            map.put("bucketName",bucketName);
+            /*
+                根据桶名、文件MD5、用户id查询是否存在上传任务
+             */
+            List<SysUploadTask> taskList = this.sysUploadTaskMapper.querySysUploadTaskByIdentifier(map);
+            if (taskList==null){
+                throw new UdsBizException(EnumUdsError.UNKNOW_ERROR.getMsg());
+            }
+            if (taskList.size() == 0) {
+                res.setData(null);
+                return res;
+            }
+            else if (taskList.size()==1){
+                //用户第一次上传，且未完成文件上传
+                SysUploadTask task = taskList.get(0);
+                TaskInfoDTO taskInfoDTO = new TaskInfoDTO().setFinished(true).
+                        setTaskRecord(TaskRecordDTO.convertFromEntity(task)).setPath(getPath(task.getBucketName(), task.getObjectKey()));
+
+                boolean doesObjectExist = ossClient.doesObjectExist(task.getBucketName(), task.getObjectKey());
+                if (!doesObjectExist) {
+                    // 未上传完，返回已上传的分片
+                    ListPartsRequest listPartsRequest = new ListPartsRequest(task.getBucketName(), task.getObjectKey(), task.getUploadId());
+                    PartListing partListing = ossClient.listParts(listPartsRequest);
+                    taskInfoDTO.setFinished(false).getTaskRecord().setExitPartList(partListing.getParts());
+                }
+                res.setData(taskInfoDTO);
+            }
+
+        }catch(Exception ex){
+            res = Res.failed(EnumUdsError.UNKNOW_ERROR.getMsg());
+            log.error("###"+ex.getMessage());
+            throw ex;
+        }
+        return res;
+    }
+```
+
+**初始化一个上传任务**
+
+```java
+public Res<TaskInfoDTO> addTask(ReqInitTaskParam reqInitTaskParam) throws UdsBizException {
+    Res<TaskInfoDTO> res = new Res<>();
+    try{
+        ParamsCheck.checkInitTaskParam(reqInitTaskParam);
+        Date currentDate = new Date();
+        String fileName = reqInitTaskParam.getFileName();
+        String suffix = fileName.substring(fileName.lastIndexOf(".")+1, fileName.length());
+        // 使用uuid生成一个objectKey
+        String objectName = StrUtil.format("{}/{}.{}", DateUtil.format(currentDate, "YYYY-MM-dd"), IdUtil.randomUUID(), suffix);
+        // 设置文件的媒体类型（图片，视频等能被浏览器解析的资源可以直接浏览器打开），获取不到的默认为流格式
+        String contentType = MediaTypeFactory.getMediaType(objectName).orElse(MediaType.APPLICATION_OCTET_STREAM).toString();
+        ObjectMetadata objectMetadata = new ObjectMetadata();
+        objectMetadata.setContentType(contentType);
+        //初始化上传片事件，根据桶名和objectKey返回分段上传任务的全局唯一标识（Upload ID）
+        // 返回uploadId，它是分片上传事件的唯一标识。您可以根据该uploadId发起相关的操作，例如取消分片上传、查询分片上传等
+        InitiateMultipartUploadRequest initiateRequest = new InitiateMultipartUploadRequest(bucketName, objectName);
+        //initiateRequest.setObjectMetadata(objectMetadata);
+        InitiateMultipartUploadResult initiateMultipartUploadResult = ossClient
+                .initiateMultipartUpload(initiateRequest);
+        String uploadId = initiateMultipartUploadResult.getUploadId();
+
+        SysUploadTask task = new SysUploadTask();
+        int chunkNum = (int) Math.ceil(reqInitTaskParam.getTotalSize() * 1.0 / reqInitTaskParam.getChunkSize());
+        task.setBucketName(bucketName)
+                .setUserId(reqInitTaskParam.getUserId())
+                .setChunkNum(chunkNum)
+                .setChunkSize(reqInitTaskParam.getChunkSize())
+                .setTotalSize(reqInitTaskParam.getTotalSize())
+                .setFileIdentifier(reqInitTaskParam.getIdentifier())
+                .setFileName(fileName)
+                .setObjectKey(objectName)
+                .setUploadId(uploadId);
+        int count = this.sysUploadTaskMapper.addSysUploadTask(task);
+        if (count<1){
+            throw new UdsBizException("add SysUploadTask error!");
+        }
+        TaskInfoDTO taskInfoDTO = new TaskInfoDTO().setFinished(false).
+                setTaskRecord(TaskRecordDTO.convertFromEntity(task)).setPath(getPath(bucketName, objectName));
+        res.setData(taskInfoDTO);
+    }catch(Exception ex){
+        res = Res.failed(EnumUdsError.UNKNOW_ERROR.getMsg());
+        log.error("###"+ex.getMessage());
+        throw ex;
+    }
+    return res;
+}
+```
+
+**根据文件唯一标识和分片编号获取一个预签名上传地址**
+
+前端在校验当前分片未上传时，调用该接口，获取到一个分片的上传地址，将分片的文件流直接通过PUT请求上传到该地址。
+
+```java
+public Res<String> queryPreSignUploadUrl(String bucket, String objectKey, Map<String, String> params) {
+        Res<String> res = new Res<>();
+        try{
+            Date currentDate = new Date();
+            Date expireDate = DateUtil.offsetMillisecond(currentDate, 60 * 10 * 1000);
+            // 生成签名URL。
+            GeneratePresignedUrlRequest request = new GeneratePresignedUrlRequest(bucket, objectKey, HttpMethod.PUT);
+            // 设置请求头。
+            Map<String, String> headers = new HashMap<String, String>();
+            // 指定ContentType。
+            headers.put(OSSHeaders.CONTENT_TYPE, "application/x-www-form-urlencoded");
+            // 将请求头加入到request中。
+            request.setHeaders(headers);
+            request.setExpiration(expireDate);
+            if (params != null) {
+                params.forEach(request::addQueryParameter);
+            }
+            URL preSignedUrl = ossClient.generatePresignedUrl(request);
+            log.info(preSignedUrl);
+            //String preSignedStr = preSignedUrl.toString().replace(globalConfig.getMinioProperties().getEndpoint(),globalConfig.getMinioUrl());
+            res.setData(preSignedUrl.toString());
+        }catch(Exception ex){
+            res = Res.failed(EnumUdsError.UNKNOW_ERROR.getMsg());
+            log.error("###"+ex.getMessage());
+            throw ex;
+        }
+        return res;
+    }
+```
+
+**根据文件唯一标识进行合并分片**
+
+当所有分片完成上传时，调用该接口。该接口是对alinyu oss sdk的方法：`this.ossClient.completeMultipartUpload(completeMultipartUploadRequest)`进行封装。
+
+```java 
+public Res<Boolean> merge(ReqFile reqFile) throws Exception {
+        Res<Boolean> res = new Res<>();
+        try{
+            Map<String,Object> map = new HashMap<>();
+            map.put("userId",reqFile.getUserId());
+            map.put("fileIdentifier",reqFile.getIdentifier());
+            map.put("bucketName",bucketName);
+            List<SysUploadTask> taskList = this.sysUploadTaskMapper.querySysUploadTaskByIdentifier(map);
+            if (taskList==null){
+                throw new UdsBizException(EnumUdsError.UNKNOW_ERROR.getMsg());
+            }
+            SysUploadTask task = taskList.get(0);
+            if (task == null) {
+                throw new UdsBizException("分片任务不存在！");
+            }
+            ListPartsRequest listPartsRequest = new ListPartsRequest(task.getBucketName(), task.getObjectKey(), task.getUploadId());
+            PartListing partListing = ossClient.listParts(listPartsRequest);
+            List<PartSummary> parts = partListing.getParts();
+            if (!task.getChunkNum().equals(parts.size())) {
+                // 已上传分块数量与记录中的数量不对应，不能合并分块
+                throw new UdsBizException("分片缺失，请重新上传");
+            }
+            // partETags是PartETag的集合。PartETag由分片的ETag和分片号组成。
+            List<PartETag> partETags =  new ArrayList<PartETag>();
+            // 遍历分片，并填充partETags。
+            for (PartSummary part : partListing.getParts()) {
+                PartETag partETag = new PartETag(part.getPartNumber(), part.getETag());
+                partETags.add(partETag);
+            }
+            //封装合并请求对象
+            CompleteMultipartUploadRequest completeMultipartUploadRequest =
+                    new CompleteMultipartUploadRequest(task.getBucketName(),task.getObjectKey(),task.getUploadId(),partETags);
+            //执行合并操作
+            CompleteMultipartUploadResult result = this.ossClient.completeMultipartUpload(completeMultipartUploadRequest);
+        } catch (Exception ex){
+            res = Res.failed(EnumUdsError.UNKNOW_ERROR.getMsg());
+            log.error("###"+ex.getMessage());
+            throw ex;
+        }
+        return res;
+    }
+```
+
+```java
+//    private void multiThreadPartUpload(File file,String objectKey) throws Exception {
+//        InputStream inStream = null;
+//        Long start = System.currentTimeMillis();
+//        try{
+//            if (file.exists()){
+//                log.info("#####多线程分片上传");
+//                String bucketName = globalConfig.getMinioProperties().getBucket();
+//                // 设置文件的媒体类型（图片，视频等能被浏览器解析的资源可以直接浏览器打开），获取不到的默认为流格式
+//                String contentType = MediaTypeFactory.getMediaType(objectKey).
+//                        orElse(MediaType.APPLICATION_OCTET_STREAM).toString();
+//                ObjectMetadata objectMetadata = new ObjectMetadata();
+//                objectMetadata.setContentType(contentType);
+//                //初始化上传片事件，根据桶名和objectKey返回分段上传任务的全局唯一标识（Upload ID）
+//                // 返回uploadId，它是分片上传事件的唯一标识。您可以根据该uploadId发起相关的操作，例如取消分片上传、查询分片上传等
+//                InitiateMultipartUploadResult initiateMultipartUploadResult = amazonS3Config.amazonS3Client()
+//                        .initiateMultipartUpload(new InitiateMultipartUploadRequest(bucketName, objectKey)
+//                                .withObjectMetadata(objectMetadata));
+//                String uploadId = initiateMultipartUploadResult.getUploadId();
+//                // partETags是PartETag的集合。PartETag由分片的ETag和分片号组成。
+//                List<PartETag> partETags =  Collections.synchronizedList(new ArrayList<>());
+//                // 根据上传的数据大小计算分片数
+//                Long fileLength = file.length();
+//                Integer partCount = new Long(fileLength / MinioConstant.DEFAULT_CHUNK_SIZE).intValue();
+//                if (fileLength % MinioConstant.DEFAULT_CHUNK_SIZE != 0) {
+//                    partCount++;
+//                }
+//                //遍历分片上传
+//                CountDownLatch countDownLatch = new CountDownLatch(partCount);
+//                List<Future<PartETag>> futureList = Collections.synchronizedList(new ArrayList());
+//                for (int i=0;i<partCount;i++){
+//                    //分片上传的位置
+//                    Long startPosition = i * MinioConstant.DEFAULT_CHUNK_SIZE;
+//                    //当前上传分片的大小
+//                    Long curPartSize = (i+1==partCount) ?
+//                            (fileLength - startPosition) : MinioConstant.DEFAULT_CHUNK_SIZE;
+//                    int finalI = i;
+//                    //设置分片上传流
+//                    //创建FIleInputStream，并通过InputStream.skip()方法跳过指定数据
+//                    inStream = new FileInputStream(file);
+//                    //跳过已经上传的数据
+//                    inStream.skip(startPosition);
+//                    InputStream finalInStream = inStream;
+//                    threadPoolConfig.threadTaskExecutor().execute(() ->
+//                            getUploadPartETag(finalI+1, curPartSize,
+//                                    bucketName, uploadId, objectKey, finalInStream,partETags,countDownLatch));
+//
+//                }
+//                countDownLatch.await();
+////                for (Future<PartETag> partETagFuture:futureList){
+////                    partETags.add(partETagFuture.get());
+////                }
+//                //log.info("futureList:"+futureList.size());
+//                // 创建CompleteMultipartUploadRequest对象。
+//                log.info("#####文件开始合并");
+//                Long mergeStart = System.currentTimeMillis();
+//                List<PartETag> collect = partETags.stream().
+//                        sorted(Comparator.comparing(PartETag::getPartNumber)).collect(Collectors.toList());
+//                CompleteMultipartUploadRequest completeMultipartUploadRequest =
+//                        new CompleteMultipartUploadRequest(bucketName, objectKey, uploadId, collect);
+//                //合并分片
+//                CompleteMultipartUploadResult result =
+//                        amazonS3Config.amazonS3Client().completeMultipartUpload(completeMultipartUploadRequest);
+//                Long mergeEnd = System.currentTimeMillis();
+//                log.info("合并耗时："+(mergeEnd-mergeStart)/1000+"s");
+//                if (inStream!=null){
+//                    inStream.close();
+//                }
+//            }
+//            else {
+//                log.info("#####"+file.getPath()+"不存在！");
+//                throw new UdsBizException("文件不存在！");
+//            }
+//            Long end = System.currentTimeMillis();
+//            log.info("#####多线程上传总耗时："+(end-start)/1000+"s");
+//        }catch(Exception e){
+//            log.error("#####"+e.getMessage());
+//            throw e;
+//        }
+//        finally {
+//            if (inStream!=null){
+//                inStream.close();
+//            }
+//        }
+//    }
+//    private void getUploadPartETag(int partNumber, Long curPartSize, String bucketName, String uploadId,
+//                                       String objectKey, InputStream inStream,List<PartETag> partETags,CountDownLatch countDownLatch) {
+//        UploadPartResult uploadPartResult = null;
+//        log.info("分片文件上传线程： {}",Thread.currentThread().getName());
+//        Long partStart = System.currentTimeMillis();
+//        try {
+//            //分片上传请求对象
+//            UploadPartRequest uploadPartRequest = new UploadPartRequest();
+//            uploadPartRequest.setBucketName(bucketName);
+//            uploadPartRequest.setKey(objectKey);
+//            uploadPartRequest.setUploadId(uploadId);
+//
+//            uploadPartRequest.setInputStream(inStream);
+//            //设置分片大小,除了最后一个分片大小没有限制，其他分片大小都是5MB
+//            uploadPartRequest.setPartSize(curPartSize);
+//            //设置分片号
+//            uploadPartRequest.setPartNumber(partNumber);
+//            //每个分片可以不按顺序上传，OSS会按照分片号将分片组成完整文件
+//            uploadPartResult = amazonS3Config.amazonS3Client().uploadPart(uploadPartRequest);
+//            partETags.add(uploadPartResult.getPartETag());
+//            Long partEnd = System.currentTimeMillis();
+//            log.info("上传第"+partNumber+"分片耗时"+(partEnd-partStart)/1000+"s");
+//            countDownLatch.countDown();
+//            //return uploadPartResult.getPartETag();
+//        } catch (Exception e) {
+//            log.error("#####"+e.getMessage());
+//        }
+//        //return null;
+//    }
+
+
+
+//    private void partUpload(File file,String objectKey) throws IOException, UdsBizException {
+//        InputStream inStream = null;
+//        try{
+//            Long start = System.currentTimeMillis();
+//
+//            if (file.exists()){
+//                log.info("#####串行方式开始分片上传");
+//                String bucketName = globalConfig.getMinioProperties().getBucket();
+//                // 设置文件的媒体类型（图片，视频等能被浏览器解析的资源可以直接浏览器打开），获取不到的默认为流格式
+//                String contentType = MediaTypeFactory.getMediaType(objectKey).orElse(MediaType.APPLICATION_OCTET_STREAM).toString();
+//                ObjectMetadata objectMetadata = new ObjectMetadata();
+//                objectMetadata.setContentType(contentType);
+//                //初始化上传片事件，根据桶名和objectKey返回分段上传任务的全局唯一标识（Upload ID）
+//                // 返回uploadId，它是分片上传事件的唯一标识。您可以根据该uploadId发起相关的操作，例如取消分片上传、查询分片上传等
+//                InitiateMultipartUploadResult initiateMultipartUploadResult = amazonS3Config.amazonS3Client()
+//                        .initiateMultipartUpload(new InitiateMultipartUploadRequest(bucketName, objectKey)
+//                                .withObjectMetadata(objectMetadata));
+//                String uploadId = initiateMultipartUploadResult.getUploadId();
+//                // partETags是PartETag的集合。PartETag由分片的ETag和分片号组成。
+//                List<PartETag> partETags =  Collections.synchronizedList(new ArrayList<>());
+//                // 根据上传的数据大小计算分片数
+//                Long fileLength = file.length();
+//                Integer partCount = new Long(fileLength / MinioConstant.DEFAULT_CHUNK_SIZE).intValue();
+//                if (fileLength % MinioConstant.DEFAULT_CHUNK_SIZE != 0) {
+//                    partCount++;
+//                }
+//                //遍历分片上传
+//                for (int i=0;i<partCount;i++){
+//                    //分片上传的位置
+//                    Long startPosition = i * MinioConstant.DEFAULT_CHUNK_SIZE;
+//                    //当前上传分片的大小
+//                    Long curPartSize = (i+1==partCount) ? (fileLength - startPosition) : MinioConstant.DEFAULT_CHUNK_SIZE;
+//                    //设置分片上传流
+//                    //创建FIleInputStream，并通过InputStream.skip()方法跳过指定数据
+//                    inStream = new FileInputStream(file);
+//                    //跳过已经上传的数据
+//                    inStream.skip(startPosition);
+//                    int finalI = i;
+//                    //分片上传请求对象
+//                    UploadPartRequest uploadPartRequest = new UploadPartRequest();
+//                    uploadPartRequest.setBucketName(bucketName);
+//                    uploadPartRequest.setKey(objectKey);
+//                    uploadPartRequest.setUploadId(uploadId);
+//
+//                    uploadPartRequest.setInputStream(inStream);
+//                    //设置分片大小,除了最后一个分片大小没有限制，其他分片大小都是5MB
+//                    uploadPartRequest.setPartSize(curPartSize);
+//                    //设置分片号
+//                    uploadPartRequest.setPartNumber(finalI +1);
+//                    UploadPartResult uploadPartResult = amazonS3Config.amazonS3Client().uploadPart(uploadPartRequest);
+//
+//                    //每次上传分片后,返回的结果包含PartETag,PartETag将被保存在partETags中
+//                    partETags.add(uploadPartResult.getPartETag());
+//
+//                }
+//                // 创建CompleteMultipartUploadRequest对象。
+//                List<PartETag> collect = partETags.stream().sorted(Comparator.comparing(PartETag::getPartNumber)).collect(Collectors.toList());
+//                CompleteMultipartUploadRequest completeMultipartUploadRequest =
+//                        new CompleteMultipartUploadRequest(bucketName, objectKey, uploadId, collect);
+//                //合并分片
+//                log.info("#####文件开始合并");
+//                CompleteMultipartUploadResult result = amazonS3Config.amazonS3Client().completeMultipartUpload(completeMultipartUploadRequest);
+//                if (inStream!=null){
+//                    inStream.close();
+//                }
+//                Long end = System.currentTimeMillis();
+//                log.info("#####串行上传总耗时："+(end-start)/1000+"s");
+//            }
+//            else {
+//                log.info("#####"+file.getPath()+"不存在！");
+//                throw new UdsBizException("文件不存在！");
+//            }
+//        }catch(Exception e){
+//            log.error("#####"+e.getMessage());
+//            throw e;
+//        }
+//        finally {
+//            if (inStream!=null){
+//                inStream.close();
+//            }
+//        }
+//    }
+//
+//    private void partUploadWithHttp(File file,String objectKey) throws Exception {
+//        InputStream inStream = null;
+//        try{
+//            Long start = System.currentTimeMillis();
+//
+//            if (file.exists()){
+//                log.info("#####Url签名方式分片上传");
+//                String bucketName = globalConfig.getMinioProperties().getBucket();
+//                // 设置文件的媒体类型（图片，视频等能被浏览器解析的资源可以直接浏览器打开），获取不到的默认为流格式
+//                String contentType = MediaTypeFactory.getMediaType(objectKey).
+//                        orElse(MediaType.APPLICATION_OCTET_STREAM).toString();
+//                ObjectMetadata objectMetadata = new ObjectMetadata();
+//                objectMetadata.setContentType(contentType);
+//                //初始化上传片事件，根据桶名和objectKey返回分段上传任务的全局唯一标识（Upload ID）
+//                // 返回uploadId，它是分片上传事件的唯一标识。您可以根据该uploadId发起相关的操作，例如取消分片上传、查询分片上传等
+//                InitiateMultipartUploadResult initiateMultipartUploadResult = amazonS3Config.amazonS3Client()
+//                        .initiateMultipartUpload(new InitiateMultipartUploadRequest(bucketName, objectKey)
+//                                .withObjectMetadata(objectMetadata));
+//                String uploadId = initiateMultipartUploadResult.getUploadId();
+//                // partETags是PartETag的集合。PartETag由分片的ETag和分片号组成。
+//                List<PartETag> partETags =  Collections.synchronizedList(new ArrayList<>());
+//                // 根据上传的数据大小计算分片数
+//                Long fileLength = file.length();
+//                Integer partCount = new Long(fileLength / MinioConstant.DEFAULT_CHUNK_SIZE).intValue();
+//                if (fileLength % MinioConstant.DEFAULT_CHUNK_SIZE != 0) {
+//                    partCount++;
+//                }
+//                //使用CountDownLatch计数器
+//                CountDownLatch countDownLatch = new CountDownLatch(partCount);
+//                // 设置签名URL的请求头。
+//                //Map<String, String> headers = new HashMap<String, String>();
+//                Map<String,String> map = new HashMap<>();
+//                map.put("uploadId", uploadId);
+//                //遍历分片上传
+//                for (int i=0;i<partCount;i++){
+//                    //分片上传的位置
+//                    Long startPosition = i * MinioConstant.DEFAULT_CHUNK_SIZE;
+//                    //当前上传分片的大小
+//                    Long curPartSize = (i+1==partCount) ?
+//                            (fileLength - startPosition) : MinioConstant.DEFAULT_CHUNK_SIZE;
+//                    map.put("partNumber", Integer.toString(i + 1));
+//                    int finalI = i;
+//                    //通过签名上传文件
+//                    String signedUrl =queryPreSignUploadUrl(bucketName, objectKey, map).getData();
+//                    threadPoolConfig.threadTaskExecutor().execute(()->{
+//                        putObjectWithHttp(signedUrl,file.getAbsolutePath(),
+//                                startPosition,curPartSize, finalI +1,countDownLatch);
+//                    });
+//
+//                }
+//                //阻塞直到分片全部上传完成
+//                countDownLatch.await();
+//
+//                // 遍历分片，并填充partETags，进行合并
+//                ListPartsRequest listPartsRequest = new ListPartsRequest(bucketName, objectKey, uploadId);
+//                PartListing partListing = amazonS3Config.amazonS3Client().listParts(listPartsRequest);
+//                log.info("#####partListing.getParts():"+partListing.getParts().size());
+//                for (PartSummary part : partListing.getParts()) {
+//                    PartETag partETag = new PartETag(part.getPartNumber(), part.getETag());
+//                    partETags.add(partETag);
+//                }
+//                CompleteMultipartUploadRequest completeMultipartUploadRequest =
+//                        new CompleteMultipartUploadRequest(bucketName, objectKey, uploadId, partETags);
+//                //合并分片
+//                log.info("#####文件开始合并");
+//                CompleteMultipartUploadResult result = amazonS3Config
+//                        .amazonS3Client()
+//                        .completeMultipartUpload(completeMultipartUploadRequest);
+//
+//                Long end = System.currentTimeMillis();
+//                log.info("#####Url签名上传总耗时："+(end-start)/1000+"s");
+//            }
+//            else {
+//                log.info("#####"+file.getPath()+"不存在！");
+//                throw new UdsBizException("文件不存在！");
+//            }
+//        }catch(Exception e){
+//            log.error("#####"+e.getMessage());
+//            throw e;
+//        }
+//    }
+//    private Res<String> queryPreSignUploadUrl(String bucket, String objectKey, Map<String, String> params) {
+//        Res<String> res = new Res<>();
+//        try{
+//            Date currentDate = new Date();
+//            Date expireDate = DateUtil.offsetMillisecond(currentDate, MinioConstant.PRE_SIGN_URL_EXPIRE.intValue());
+//            GeneratePresignedUrlRequest request = new GeneratePresignedUrlRequest(bucket, objectKey)
+//                    .withExpiration(expireDate).withMethod(HttpMethod.PUT);
+//            if (params != null) {
+//                params.forEach(request::addRequestParameter);
+//            }
+//            URL preSignedUrl = amazonS3.generatePresignedUrl(request);
+//
+//            log.info(preSignedUrl);
+//            //String preSignedStr = preSignedUrl.toString().replace(globalConfig.getMinioProperties().
+//            // getEndpoint(),globalConfig.getMinioProperties().getEndpointOuter());
+//            res.setData(preSignedUrl.toString());
+//        }catch(Exception ex){
+//            res = Res.failed(EnumUdsError.UNKNOW_ERROR.getMsg());
+//            log.error("###"+ex.getMessage());
+//            throw ex;
+//        }
+//        return res;
+//    }
+//    public void putObjectWithHttp(String signedUrl, String pathName, Long startPosition, Long curPartSize,
+//                                  int partNumber,CountDownLatch countDownLatch){
+//        CloseableHttpClient httpClient = null;
+//        CloseableHttpResponse response = null;
+//        FileInputStream inStream = null;
+//        Long start = System.currentTimeMillis();
+//        try {
+//            HttpPut put = new HttpPut(signedUrl);
+//            inStream = new FileInputStream(pathName);
+//            // 跳过已经上传的分片。
+//            inStream.skip(startPosition);
+//            InputStreamEntity entity = new InputStreamEntity(inStream, curPartSize);
+//            put.setEntity(entity);
+//            // 如果生成签名URL时设置了header参数，例如用户元数据，存储类型等，
+//            // 则调用签名URL上传文件时，也需要将这些参数发送至服务端。如果签名和发送至服务端的不一致，会报签名错误。
+////            for(Map.Entry header: headers.entrySet()){
+////                put.addHeader(header.getKey().toString(),header.getValue().toString());
+////            }
+//            httpClient = HttpClients.createDefault();
+//            response = httpClient.execute(put);
+//            if(response.getStatusLine().getStatusCode() == 200){
+//                log.info("第"+partNumber+"个分片上传成功");
+//            }
+//            Long end = System.currentTimeMillis();
+//            log.info("分片"+partNumber+"耗时："+(end-start)/1000+"s");
+//        } catch (Exception e){
+//            log.info("#####"+e.getMessage());
+//        } finally {
+//            countDownLatch.countDown();
+//            try {
+//                if (response!=null){
+//                    response.close();
+//                }
+//                if (httpClient!=null){
+//                    httpClient.close();
+//                }
+//                if (inStream!=null){
+//                    inStream.close();
+//                }
+//            } catch (IOException e) {
+//                log.info("#####"+e.getMessage());
+//            }
+//        }
+//    }
+
+```
+##  OSS文件下载
+
+### 简单下载
+
+通过调用OSS API的GetObject接口，下载已经上传的文件，适用于一次Http请求交互即可完成的下载场景
+
+### 断点续传下载
+
+OSS提供了从Object指定的位置开始下载的功能，在下载大的Object的时候，可以分多次下载。如果下载中断，重启时也可以从上次完成的位置开始继续下载。
+
+详细内容：https://help.aliyun.com/zh/oss/user-guide/resumable-download-7?spm=a2c4g.11186623.0.0.6ce035deRJptpU
+
+### 授权给第三方下载
+
+因项目先把前端上传的文件进行解析得到json文件后，再上传到OSS，前端需要通过Http请求得到解析后的json文件，如果json文件所属的bucket是public的则直接通过OSS的API 的GeneratePresignedUrl接口，但是这样会造成不安全隐患，无论任何用户拿到下载链接都可以下载该文件，增加了服务端额外的开销，因此需要bucket设置成private，且通过开通阿里云Sts服务授权的方式来给第三方提供下载链接且通过指定URL过期时间来限制访客的访问时长，示意图如下：
+
+![](C:\Users\Admin\Desktop\工作\uds\学习\阿里云OSS\sts.png)
+
+
+
+关键代码如下：
+
+```java
+Controller
+@ApiOperation("获取下载URL")
+@RequestMapping(value = "/get-download-url",method = RequestMethod.POST)
+public Res<String> getDownLoadUrl(@RequestBody ReqUrl reqUrl){
+    Res<String> res = new Res<>();
+    String userId = ((JSONObject) JSONObject.parse(this.request.getHeader("user"))).getString("user_name");
+    try{
+        res = this.cloudService.getDownLoadUrl(reqUrl);
+    }catch(Exception e){
+        res.setCode(Constant.Error);
+        res.setMsg(EnumUdsError.UNKNOW_ERROR.getMsg());
+        log.error("######"+e.getMessage());
+    }
+    return res;
+}
+
+Service
+@Override
+public Res<String> getDownLoadUrl(ReqUrl reqUrl) throws Exception {
+    Res<String> res = new Res<>();
+    String url = ossUtil.getObjectWithUrl(reqUrl.getBucketName(), reqUrl.getObjectKey());
+    res.setData(url);
+    return res;
+}
+
+public String getObjectWithUrl(String bucketName,String objectKey) throws Exception {
+    String downLoadUrl = null;
+    try {
+        AssumeRoleResponse response = getStsToken();
+        log.info("####response:"+response);
+        OSS ossClient = new OSSClientBuilder().build(globalConfig.getAliYunOssProperties().getEndpoint(),
+                                                     response.getCredentials().getAccessKeyId(),
+                                                     response.getCredentials().getAccessKeySecret(),
+                                                     response.getCredentials().getSecurityToken());
+        // 设置签名URL过期时间，单位为毫秒。
+        Date expiration = new Date(System.currentTimeMillis() +
+                                   globalConfig.getAliYunOssProperties().getDuration() * 1000);
+        // 生成以GET方法访问的签名URL，访客可以直接通过浏览器访问相关内容。
+
+        URL url = ossClient.generatePresignedUrl(bucketName, objectKey, expiration);
+        downLoadUrl = url.toString();
+    }catch(Exception e){
+        log.error("#####"+e.getMessage());
+        throw e;
+    }
+    return downLoadUrl;
+}
+
+public AssumeRoleResponse getStsToken() throws Exception {
+    AssumeRoleResponse response = null;
+    try {
+        if (redisTemplate.opsForValue().get("stsToken")!=null){
+            response = (AssumeRoleResponse) redisTemplate.opsForValue().get("stsToken");
+        }
+        else{
+            GlobalConfig.StsProperties stsProperties = globalConfig.getAliYunOssProperties().getStsProperties();
+            // regionId表示RAM的地域ID。以华东1（杭州）地域为例，regionID填写为cn-hangzhou。也可以保留默认值，默认值为空字符串（""）。
+            DefaultProfile.addEndpoint(stsProperties.getRegionId(),
+                                       stsProperties.getProduct(),stsProperties.getEndpointSts());
+            // 构造default profile。
+            IClientProfile profile = DefaultProfile.getProfile(stsProperties.getRegionId(),
+                                                               globalConfig.getAliYunOssProperties().getAccessKey(),
+                                                               globalConfig.getAliYunOssProperties().getAccessSecret());
+            // 构造client。
+            DefaultAcsClient client = new DefaultAcsClient(profile);
+            final AssumeRoleRequest request = new AssumeRoleRequest();
+            request.setRoleArn(stsProperties.getRoleArn());
+            request.setRoleSessionName(stsProperties.getRoleSessionName());
+            request.setDurationSeconds(stsProperties.getDurationSeconds());
+            response =  client.getAcsResponse(request);
+            log.info("####response:"+response);
+            redisTemplate.opsForValue().set("stsToken",response,stsProperties.getDurationSeconds(), TimeUnit.SECONDS);
+        }
+    }catch(Exception e){
+        log.error("###"+e.getMessage());
+        throw e;
+    }
+    return response;
+}
+```
+
+
+
+
+
+
+
+# Minio大文件分片上传

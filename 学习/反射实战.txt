@@ -1,0 +1,3 @@
+#### 反射
+
+1、Class.forName：Class类的静态方法获得与字符串对应的Class对象
